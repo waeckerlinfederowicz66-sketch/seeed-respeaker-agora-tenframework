@@ -77,7 +77,8 @@ static esp_err_t recorder_pipeline_open(void)
 
   algorithm_stream_cfg_t algo_config = ALGORITHM_STREAM_CFG_DEFAULT();
   algo_config.input_type = ALGORITHM_STREAM_INPUT_TYPE1;
-  algo_config.algo_mask  = ALGORITHM_STREAM_USE_AEC;
+  //algo_config.algo_mask  = ALGORITHM_STREAM_USE_AEC;
+  algo_config.algo_mask  = 0;
   algo_config.swap_ch    = true;
   element_algo = algo_stream_init(&algo_config);
   audio_element_set_music_info(element_algo, CONFIG_PCM_SAMPLE_RATE, 1, 16);
@@ -168,7 +169,7 @@ static void audio_send_thread(void *arg)
       printf("Sending audio frame %d, size=%d bytes, non-zero samples: %d/32\n",
              frame_count, CONFIG_PCM_DATA_LEN, non_zero_count);
       }
-    
+
 
     send_rtc_audio_frame(audio_pcm_buf, CONFIG_PCM_DATA_LEN);
   }
@@ -196,11 +197,11 @@ void setup_audio(void)
   // audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_BOTH, AUDIO_HAL_CTRL_START);
   // audio_hal_set_volume(board_handle->audio_hal, 85);
 
-  // AIC3104 is initialized directly in llm_main.c, no need for audio_board_init()                                                
-  // board_handle = audio_board_init();                                                                                           
-  // audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_BOTH, AUDIO_HAL_CTRL_START);                              
-  // audio_hal_set_volume(board_handle->audio_hal, 85);                                                                           
-                                                                                                                                   
+  // AIC3104 is initialized directly in llm_main.c, no need for audio_board_init()
+  // board_handle = audio_board_init();
+  // audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_BOTH, AUDIO_HAL_CTRL_START);
+  // audio_hal_set_volume(board_handle->audio_hal, 85);
+
   printf("setup_audio: using AIC3104 direct initialization\n");
 }
 
@@ -222,11 +223,11 @@ int audio_get_volume(void)
 
   // return volume;
 
-  return 85;                                                                                                                      
+  return 85;
 
 }
 
 void audio_set_volume(int volume)
 {
-  printf("audio_set_volume: volume=%d (AIC3104 volume control not yet implemented)\n", volume);                                   
+  printf("audio_set_volume: volume=%d (AIC3104 volume control not yet implemented)\n", volume);
 }
