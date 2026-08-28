@@ -1,0 +1,7 @@
+{
+  "params": {
+    "api_key": "${env:FLOWSPEECH_API_KEY}",
+    "base_url": "https://flowspeech.io",
+    "voice_name": "Kore"
+  }
+}

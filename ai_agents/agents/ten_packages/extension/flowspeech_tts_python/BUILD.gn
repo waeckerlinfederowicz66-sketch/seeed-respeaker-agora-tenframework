@@ -1,0 +1,5 @@
+import("//ten_runtime/build/ten_extension.gni")
+
+ten_extension("flowspeech_tts_python") {
+  is_python = true
+}

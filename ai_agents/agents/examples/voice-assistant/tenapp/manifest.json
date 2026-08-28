@@ -103,6 +103,9 @@
       "path": "../../../ten_packages/extension/fish_audio_tts_python"
     },
     {
+      "path": "../../../ten_packages/extension/flowspeech_tts_python"
+    },
+    {
       "path": "../../../ten_packages/extension/google_tts_python"
     },
     {
