@@ -1,7 +1,7 @@
 {
   "type": "extension",
   "name": "flowspeech_tts_python",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "dependencies": [
     {
       "type": "system",
@@ -22,6 +22,7 @@
       "**.tent",
       "**.py",
       "README.md",
+      "CHANGELOG.md",
       "requirements.txt"
     ]
   },
@@ -41,6 +42,8 @@
             "voice_name": {"type": "string"}
           }
         },
+        "total_timeout": {"type": "float64"},
+        "max_retries": {"type": "int32"},
         "dump": {"type": "bool"},
         "dump_path": {"type": "string"}
       }

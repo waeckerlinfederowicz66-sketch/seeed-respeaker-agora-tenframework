@@ -1,4 +1,6 @@
 {
+  "total_timeout": 600.0,
+  "max_retries": 2,
   "params": {
     "api_key": "${env:FLOWSPEECH_API_KEY}",
     "base_url": "https://flowspeech.io",

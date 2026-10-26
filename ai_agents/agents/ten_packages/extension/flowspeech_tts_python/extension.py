@@ -15,7 +15,7 @@ from .flowspeech_tts import FlowSpeechTTSClient
 
 
 class FlowSpeechTTSExtension(AsyncTTS2HttpExtension):
-    """Generate 24 kHz mono PCM speech with the FlowSpeech HTTP API."""
+    """Download public API v1 WAV recordings and emit 24 kHz mono PCM."""
 
     def __init__(self, name: str) -> None:
         super().__init__(name)
