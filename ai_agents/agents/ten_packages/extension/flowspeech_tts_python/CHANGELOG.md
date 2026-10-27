@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Hide rejected credentials in configuration errors and suppress raw upstream error fields.
+- Reject audio after conversion or PCM emission exhausts the total budget.
+- Preserve HTTP status and Retry-After after response-body or cleanup failures;
+  known authentication failures are not retried.
+- Add offline regression coverage; these local changes are not a published release.
+
 ## 0.2.0 (Unreleased)
 
 - Replace the retired synchronous endpoint and base64 envelope with public API v1 submit, poll and download

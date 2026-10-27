@@ -2,7 +2,9 @@ import asyncio
 import io
 import json
 import struct
+import traceback
 import wave
+from email.utils import formatdate
 from uuid import UUID, uuid4
 
 import httpx
@@ -342,7 +344,7 @@ async def test_job_failure_is_not_http_success(status):
         )
     )
     assert len(events) == 1 and events[0][1] == Event.ERROR
-    assert status.encode() in events[0][0] and b"stopped" in events[0][0]
+    assert status.encode() in events[0][0] and b"upstream_error" in events[0][0]
     assert JOB_ID in env.errors[0]
     assert metadata["api_request_id"] in env.errors[0]
 
@@ -423,11 +425,11 @@ async def test_api_errors_and_authentication_event(status):
             status,
             json={
                 "error": {
-                    "code": "test_error",
+                    "code": "invalid_request",
                     "message": "message",
                     "retryable": False,
                 },
-                "traceId": "trace-id",
+                "traceId": JOB_ID,
             },
         )
 
@@ -435,9 +437,101 @@ async def test_api_errors_and_authentication_event(status):
     assert events[0][1] == (
         Event.INVALID_KEY_ERROR if status in (401, 403) else Event.ERROR
     )
-    assert b"test_error" in events[0][0] and b"trace-id" in events[0][0]
+    assert b"invalid_request" in events[0][0] and JOB_ID.encode() in events[0][0]
     assert len(calls) == 1
     assert "test-key" not in env.errors[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [200, 202, 401, 403, 429, 503])
+@pytest.mark.parametrize("download", [False, True])
+@pytest.mark.parametrize("failure", ["body", "close"])
+@pytest.mark.parametrize("cooldown", ["60", formatdate(60, usegmt=True)])
+async def test_interrupted_response_preserves_status_and_cooldown(
+    status, download, failure, cooldown
+):
+    class BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"x"
+            if failure == "body":
+                raise httpx.ReadError("private-body-sentinel")
+
+        async def aclose(self):
+            if failure == "close":
+                raise httpx.ReadError("private-close-sentinel")
+
+    broken = httpx.Response(
+        status, headers={"Retry-After": cooldown}, stream=BrokenStream()
+    )
+    responses = (
+        [
+            httpx.Response(202, json=job()),
+            broken,
+            httpx.Response(200, content=wav_bytes()),
+        ]
+        if download
+        else [
+            broken,
+            httpx.Response(202, json=job()),
+            httpx.Response(200, content=wav_bytes()),
+        ]
+    )
+    pending = iter(responses)
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return next(pending)
+
+    clock = Clock()
+    events, metadata, env = await collect(
+        respond, clock=clock, settings=config(max_retries=1)
+    )
+    if status in (401, 403):
+        assert clock.waits == []
+        assert len(calls) == (2 if download else 1)
+        assert [kind for _, kind in events] == [
+            Event.ERROR if download else Event.INVALID_KEY_ERROR
+        ]
+    else:
+        assert clock.waits == [60]
+        assert events[-1][1] == Event.END
+        assert len(calls) == 3
+        if not download:
+            assert calls[0].content == calls[1].content
+            assert (
+                calls[0].headers["Idempotency-Key"]
+                == calls[1].headers["Idempotency-Key"]
+                == REQUEST_ID
+            )
+        else:
+            assert all("authorization" not in request.headers for request in calls[1:])
+    assert broken.is_closed
+    assert metadata["api_request_id"] == REQUEST_ID
+    assert "private-body-sentinel" not in repr(events) + repr(env.errors)
+    assert "private-close-sentinel" not in repr(events) + repr(env.errors)
+
+
+@pytest.mark.asyncio
+async def test_interrupted_rate_limit_cooldown_exceeds_budget_without_retry():
+    class BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise httpx.ReadError("synthetic body failure")
+            yield b""
+
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(429, headers={"Retry-After": "60"}, stream=BrokenStream())
+
+    clock = Clock()
+    events, metadata, _ = await collect(
+        respond, clock=clock, settings=config(total_timeout=10.0)
+    )
+    assert len(calls) == 1 and clock.waits == []
+    assert [kind for _, kind in events] == [Event.ERROR]
+    assert b"deadline" in events[0][0] and metadata["api_request_id"] == REQUEST_ID
 
 
 @pytest.mark.asyncio
@@ -718,6 +812,128 @@ def test_deadline_retry_config(kwargs):
 def test_sensitive_config_masks_key():
     assert "test-key" not in config().to_str()
     assert "test-key" in config().to_str(sensitive_handling=False)
+
+
+@pytest.mark.parametrize(
+    "value", ["private-sentinel ", b"private-sentinel", {"token": "private-sentinel"}]
+)
+@pytest.mark.parametrize(
+    "entry", ["validate", "update_params", "resolved_params", "client"]
+)
+def test_invalid_key_never_survives_public_validation(value, entry):
+    settings = FlowSpeechTTSConfig(params={"api_key": value, "voice_name": "Kore"})
+    with pytest.raises(ValueError) as caught:
+        if entry == "client":
+            FlowSpeechTTSClient(settings, FakeTenEnv())
+        else:
+            getattr(settings, entry)()
+    assert "private-sentinel" not in str(caught.value)
+    assert "private-sentinel" not in "".join(traceback.format_exception(caught.value))
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+
+
+def test_invalid_url_diagnostic_does_not_reflect_configuration():
+    settings = FlowSpeechTTSConfig(
+        params={
+            "api_key": "test-only",
+            "voice_name": "Kore",
+            "base_url": "https://example.test:private-sentinel",
+        }
+    )
+    with pytest.raises(ValueError) as caught:
+        settings.validate()
+    assert "private-sentinel" not in "".join(traceback.format_exception(caught.value))
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("where", ["api", "job", "download"])
+async def test_upstream_error_fields_never_reach_logs_or_events(where, caplog):
+    marker = "private-sentinel"
+    private_url = "https://audio.example.test/a?signature=private-link"
+    details = {
+        "code": marker,
+        "message": marker + " " + private_url,
+        "retryable": False,
+    }
+    calls = []
+    settings = FlowSpeechTTSConfig(
+        params={"api_key": marker, "voice_name": "Kore"}, max_retries=0
+    )
+
+    def respond(request):
+        calls.append(request)
+        if where == "job":
+            return httpx.Response(200, json=job("failed", error=details))
+        if where == "download" and request.method == "POST":
+            return httpx.Response(202, json=job())
+        return httpx.Response(
+            403, json={"error": details, "traceId": marker + private_url}
+        )
+
+    events, metadata, env = await collect(respond, settings=settings)
+    assert events[0][1] == (Event.INVALID_KEY_ERROR if where == "api" else Event.ERROR)
+    rendered = repr(events) + repr(env.errors) + caplog.text
+    assert marker not in rendered and "private-link" not in rendered
+    assert REQUEST_ID in rendered and metadata["api_request_id"] == REQUEST_ID
+    assert len(calls) == (2 if where == "download" else 1)
+    if where == "download":
+        assert "authorization" not in calls[-1].headers
+
+
+@pytest.mark.asyncio
+async def test_conversion_expiry_rejects_audio_and_success(monkeypatch):
+    from flowspeech_tts_python import flowspeech_tts as module
+
+    clock = Clock()
+    original = module.wav_to_pcm
+    responses = [
+        httpx.Response(202, json=job()),
+        httpx.Response(200, content=wav_bytes()),
+    ]
+
+    def conversion(content):
+        pcm = original(content)
+        clock.now = 2
+        return pcm
+
+    monkeypatch.setattr(module, "wav_to_pcm", conversion)
+    pending = iter(responses)
+    events, metadata, _ = await collect(
+        lambda _: next(pending), settings=config(total_timeout=1.0), clock=clock
+    )
+    assert [kind for _, kind in events] == [Event.ERROR]
+    assert b"deadline" in events[0][0]
+    assert metadata["job_id"] == JOB_ID and metadata["api_request_id"] == REQUEST_ID
+    assert all(response.is_closed for response in responses)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("samples", [10, 3000])
+async def test_emission_expiry_stops_later_pcm_and_end(samples):
+    clock = Clock()
+    responses = iter(
+        [
+            httpx.Response(202, json=job()),
+            httpx.Response(200, content=wav_bytes(b"\x01\x02" * samples)),
+        ]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: next(responses))
+    ) as http:
+        client = FlowSpeechTTSClient(
+            config(total_timeout=1.0), FakeTenEnv(), http_client=http, clock=clock.time
+        )
+        stream = client.get("Hello", "correlation")
+        first = await anext(stream)
+        assert first[1] == Event.RESPONSE
+        clock.now = 2
+        rest = [event async for event in stream]
+        assert [kind for _, kind in rest] == [Event.ERROR]
+        assert b"deadline" in rest[0][0] and REQUEST_ID.encode() in rest[0][0]
+        await client.clean()
+        assert not http.is_closed
 
 
 @pytest.mark.asyncio

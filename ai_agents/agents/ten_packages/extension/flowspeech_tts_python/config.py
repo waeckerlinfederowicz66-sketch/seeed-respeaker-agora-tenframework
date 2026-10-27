@@ -20,7 +20,7 @@ def secure_url(value: str) -> httpx.URL:
 
 
 class FlowSpeechParams(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
     api_key: str = Field(min_length=1)
     base_url: str = DEFAULT_BASE_URL
     voice_name: str = Field(min_length=1, max_length=100)
@@ -53,6 +53,8 @@ class FlowSpeechParams(BaseModel):
 class FlowSpeechTTSConfig(AsyncTTS2HttpConfig):
     """FlowSpeech public API v1 job configuration."""
 
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     dump: bool = Field(default=False, description="Dump generated PCM audio")
     dump_path: str = Field(default="/tmp", description="PCM dump directory")
     params: dict[str, Any] = Field(default_factory=dict)
@@ -62,7 +64,14 @@ class FlowSpeechTTSConfig(AsyncTTS2HttpConfig):
     max_retries: int = Field(default=2, ge=0, le=10, strict=True)
 
     def resolved_params(self) -> FlowSpeechParams:
-        return FlowSpeechParams.model_validate(self.params)
+        try:
+            return FlowSpeechParams.model_validate(self.params)
+        except (ValueError, httpx.InvalidURL):
+            pass
+        # Raise outside the handler so no input-bearing validation error is chained.
+        raise ValueError(
+            "Invalid FlowSpeech params: check api_key, base_url and voice_name"
+        )
 
     def update_params(self) -> None:
         self.validate()

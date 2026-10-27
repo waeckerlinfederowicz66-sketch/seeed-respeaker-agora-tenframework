@@ -24,6 +24,20 @@ BYTES_PER_SAMPLE = 2
 DEFAULT_CHUNK_SIZE = 4096
 MAX_JSON_BYTES = 1024 * 1024
 MAX_AUDIO_BYTES = 100 * 1024 * 1024
+PUBLIC_ERROR_CODES = frozenset(
+    {
+        "invalid_request",
+        "invalid_api_key",
+        "insufficient_scope",
+        "insufficient_credits",
+        "subscription_required",
+        "rate_limited",
+        "service_unavailable",
+        "job_not_found",
+        "job_already_completed",
+        "idempotency_conflict",
+    }
+)
 
 
 class Result(BaseModel):
@@ -81,6 +95,13 @@ class FlowSpeechError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.api = api
+
+
+class ResponseReadError(httpx.TransportError):
+    def __init__(self, response: httpx.Response):
+        super().__init__("FlowSpeech response body or cleanup failed")
+        self.status = response.status_code
+        self.retry_after = response.headers.get("retry-after")
 
 
 def validate_wav_structure(content: bytes) -> None:
@@ -171,8 +192,7 @@ class FlowSpeechTTSClient(AsyncTTS2HttpClient):
             raise FlowSpeechError("FlowSpeech total deadline exceeded", 408)
         return remaining
 
-    def _retry_after(self, response: httpx.Response | None) -> float:
-        value = response.headers.get("retry-after") if response is not None else None
+    def _retry_after(self, value: str | None) -> float:
         if not value:
             return 5.0
         try:
@@ -188,14 +208,41 @@ class FlowSpeechTTSClient(AsyncTTS2HttpClient):
                 return 5.0
         return max(5.0, seconds) if math.isfinite(seconds) else 5.0
 
-    async def _wait(self, response: httpx.Response | None = None) -> None:
-        delay = self._retry_after(response)
+    async def _wait(
+        self, response: httpx.Response | None = None, *, retry_after: str | None = None
+    ) -> None:
+        value = (
+            retry_after
+            if retry_after is not None
+            else (response.headers.get("retry-after") if response is not None else None)
+        )
+        delay = self._retry_after(value)
         if delay >= self._remaining():
             raise FlowSpeechError(
                 "FlowSpeech deadline cannot accommodate Retry-After/poll delay", 408
             )
         await self._sleep(delay)
         self._remaining()
+
+    def _error_code(self, code: str) -> str:
+        return (
+            code
+            if code in PUBLIC_ERROR_CODES and self.params.api_key not in code
+            else "upstream_error"
+        )
+
+    def _trace_id(self, value: str | None) -> str | None:
+        try:
+            normalized = str(UUID(value)) if value else None
+        except ValueError:
+            return None
+        if (
+            normalized
+            and normalized == value.lower()
+            and self.params.api_key not in normalized
+        ):
+            return normalized
+        return None
 
     async def _read(self, request: httpx.Request, download: bool) -> httpx.Response:
         response = await self._client.send(
@@ -227,8 +274,13 @@ class FlowSpeechTTSClient(AsyncTTS2HttpClient):
                     content=content.getvalue(),
                     request=request,
                 )
+        except httpx.TransportError:
+            raise ResponseReadError(response) from None
         finally:
-            await response.aclose()
+            try:
+                await response.aclose()
+            except httpx.TransportError:
+                raise ResponseReadError(response) from None
 
     async def _request(
         self,
@@ -262,13 +314,25 @@ class FlowSpeechTTSClient(AsyncTTS2HttpClient):
             try:
                 response = await self._read(request, download)
             except httpx.TransportError as exc:
-                if attempt == self.config.max_retries:
+                status = exc.status if isinstance(exc, ResponseReadError) else None
+                retryable = (
+                    status is None
+                    or status == 429
+                    or (200 <= status < 300 or 500 <= status < 600)
+                )
+                if not retryable or attempt == self.config.max_retries:
                     raise FlowSpeechError(
                         "FlowSpeech download transport failed"
                         if download
-                        else "FlowSpeech API transport failed"
+                        else "FlowSpeech API transport failed",
+                        status or 502,
+                        not download,
                     ) from exc
-                await self._wait()
+                await self._wait(
+                    retry_after=exc.retry_after
+                    if isinstance(exc, ResponseReadError)
+                    else None
+                )
                 continue
             if response.status_code in (
                 (200,) if download or method == "GET" else (200, 202)
@@ -287,11 +351,12 @@ class FlowSpeechTTSClient(AsyncTTS2HttpClient):
             if retryable and attempt < self.config.max_retries:
                 await self._wait(response)
                 continue
-            detail = (
-                f"{error.error.code}: {error.error.message}; traceId={error.traceId}"
-                if error
-                else f"HTTP {response.status_code}"
-            )
+            detail = f"HTTP {response.status_code}"
+            if error is not None:
+                detail += f"; code={self._error_code(error.error.code)}"
+                trace_id = self._trace_id(error.traceId)
+                if trace_id:
+                    detail += f"; traceId={trace_id}"
             raise FlowSpeechError(
                 f"FlowSpeech {'download' if download else 'API'} error: {detail}",
                 response.status_code,
@@ -327,11 +392,7 @@ class FlowSpeechTTSClient(AsyncTTS2HttpClient):
                 raise FlowSpeechError("FlowSpeech returned a different job ID")
             self._job_id = str(job.id)
             if job.status in ("failed", "cancelled"):
-                detail = (
-                    f"{job.error.code}: {job.error.message}"
-                    if job.error
-                    else job.status
-                )
+                detail = self._error_code(job.error.code) if job.error else job.status
                 raise FlowSpeechError(f"FlowSpeech job {job.status}: {detail}", 422)
             if job.status == "success":
                 if job.resultDeleted:
@@ -347,7 +408,9 @@ class FlowSpeechTTSClient(AsyncTTS2HttpClient):
                         "FlowSpeech returned an unsafe audio URL"
                     ) from exc
                 audio = await self._request("GET", url, download=True)
-                return wav_to_pcm(audio.content)
+                pcm = wav_to_pcm(audio.content)
+                self._remaining()
+                return pcm
             await self._wait(response)
             response = await self._request("GET", f"{self._url}/{self._job_id}")
 
@@ -375,10 +438,12 @@ class FlowSpeechTTSClient(AsyncTTS2HttpClient):
                 if self._cancelled:
                     yield None, TTS2HttpResponseEventType.FLUSH
                     return
+                self._remaining()
                 yield (
                     pcm[offset : offset + DEFAULT_CHUNK_SIZE],
                     TTS2HttpResponseEventType.RESPONSE,
                 )
+            self._remaining()
             yield None, TTS2HttpResponseEventType.END
         except asyncio.CancelledError:
             if not self._cancelled:

@@ -29,7 +29,9 @@ Set `FLOWSPEECH_API_KEY` on the server. Do not commit the key to source control.
 ```
 
 The timeout is a finite positive total budget in seconds for submission, retries,
-polling and download, at most 7200 seconds. `max_retries` is zero to ten retries per
+polling, download, conversion and PCM emission, at most 7200 seconds. Expiry after
+conversion or while the consumer pauses emission stops further audio and END.
+`max_retries` is zero to ten retries per
 HTTP operation. `base_url` accepts an HTTPS origin or the complete
 `/api/v1/tts/jobs` endpoint, without query, fragment or embedded credentials.
 Only configure a trusted host because it receives the API key and text.
@@ -47,12 +49,17 @@ multiple text segments. Internal submission retries preserve the API UUID and
 the exact JSON body. Download retries reuse the result URL and never regenerate.
 
 `get_extra_metadata()` exposes `voice`, `api_request_id` and `job_id` for the
-current or most recent invocation. Errors include the recovery IDs, API error
-code and trace ID when available. Keep those IDs when a call fails or is stopped.
+current or most recent invocation. Errors include the recovery IDs, recognized
+public API error codes and canonical UUID trace IDs when available. Raw upstream
+messages, unrecognized codes and malformed trace IDs are not logged or emitted.
+Invalid configuration reports a fixed error without rejected credential values.
+Keep recovery IDs when a call fails or is stopped.
 Starting a new `get()` is a new recording, not recovery of an earlier one.
 
 Polling waits at least five seconds and respects a longer numeric or HTTP-date
-`Retry-After`. Pending states are queued, running, merging and settling. Failed,
+`Retry-After`. Response-body and cleanup transport failures also retain the known
+HTTP status and cooldown; 401/403 failures are not retried.
+Pending states are queued, running, merging and settling. Failed,
 cancelled, deleted or malformed jobs produce an error event instead of audio.
 HTTP 200 alone is not success. API 401/403 responses produce INVALID_KEY_ERROR;
 a storage download 403 is an ordinary ERROR.
